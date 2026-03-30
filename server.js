@@ -211,8 +211,7 @@ function isComebackCandidate(m) {
 
   return true;
 }
-const startTime = Date.now();
-const marketMetaCache = new Map();
+// (startTime and marketMetaCache declared above)
 
 // ============================================================
 // HELPERS
@@ -334,12 +333,23 @@ function isTradableMarket(m) {
 }
 
 function classifySport(title, ticker) {
+  // PRIORITY 1: Ticker prefix — deterministic, no ambiguity
+  const upper = (ticker || "").toUpperCase();
+  if (upper.startsWith("KXNBA") || upper.startsWith("KXNCAAM")) return "NBA";
+  if (upper.startsWith("KXNCAAW")) return "NBA"; // women's college basketball
+  if (upper.startsWith("KXNFL")) return "NFL";
+  if (upper.startsWith("KXNHL")) return "NHL";
+  if (upper.startsWith("KXTENNIS") || upper.startsWith("KXATP") || upper.startsWith("KXWTA")) return "TENNIS";
+  if (upper.startsWith("KXMLB")) return "MLB";
+  if (upper.startsWith("KXSOCCER")) return "SOCCER";
+
+  // PRIORITY 2: Fall back to title/ticker regex for non-prefixed markets
   const t = ((title || "") + " " + (ticker || "")).toLowerCase();
-  if (/kxnba|nba|basketball|lakers|celtics|nuggets|warriors|bucks|76ers|knicks|nets|heat|suns|mavs|clippers|rockets|thunder|timberwolves|grizzlies|pelicans|kings|hawks|cavaliers|pistons|pacers|magic|bulls|hornets|wizards|raptors|spurs|blazers|jazz|denver|boston|san antonio|cleveland|minnesota|philadelphia|phoenix|los angeles l|chicago|dallas|memphis|atlanta|miami|sacramento|detroit|indiana|orlando|charlotte|washington|toronto|portland|utah|new york k|brooklyn|houston|oklahoma|golden state|milwaukee|jokić|murray|wembanyama|mitchell|harden|giddey|mobley|braun|johnson|porziņģis|draymond|green|castle|vassell/i.test(t)) return "NBA";
-  if (/kxnfl|nfl|football|chiefs|eagles|bills|49ers|cowboys|ravens|dolphins|lions|bengals|steelers|texans|packers|jaguars|broncos|seahawks|chargers|vikings|saints|falcons|bears|commanders|browns|panthers|titans|raiders|colts|rams|buccaneers/i.test(t)) return "NFL";
-  if (/kxnhl|nhl|hockey|rangers|bruins|oilers|avalanche|hurricanes|stars|maple leafs|canadiens|lightning|penguins|capitals|flames|senators|kraken|blue jackets|sabres|red wings|islanders|devils|wild|predators|canucks|ducks|coyotes|sharks|blues|blackhawks|flyers|goals scored/i.test(t)) return "NHL";
-  if (/kxtennis|tennis|atp|wta|djokovic|sinner|alcaraz|medvedev|zverev|rublev|tsitsipas|ruud|fritz|swiatek|sabalenka|gauff|rybakina|pegula|halys|schwaerzler|navone|shevchenko|tirante|vallejo|vukic|udvardy|merida|hurkacz|roland|french|wimbledon/i.test(t)) return "TENNIS";
-  if (/kxmlb|mlb|baseball|yankees|red sox|dodgers|mets|cubs|braves|astros|phillies|padres|mariners|orioles|guardians|twins|royals|brewers|diamondbacks|reds|pirates|rays|blue jays|angels|athletics|marlins|nationals|rockies|white sox|tigers|cardinals|cincinnati|tampa bay|kansas city|new york y|new york m|arizona|colorado|san francisco|san diego|seattle|baltimore|st\. louis|runs scored|stanton|judge/i.test(t)) return "MLB";
+  if (/\b(nba|basketball)\b/i.test(t)) return "NBA";
+  if (/\b(nfl|football)\b/i.test(t)) return "NFL";
+  if (/\b(nhl|hockey)\b/i.test(t)) return "NHL";
+  if (/\b(tennis|atp|wta)\b/i.test(t)) return "TENNIS";
+  if (/\b(mlb|baseball)\b/i.test(t)) return "MLB";
   return "OTHER";
 }
 
