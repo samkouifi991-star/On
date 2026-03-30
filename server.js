@@ -117,26 +117,53 @@ function extractPrices(m) {
 
 function isSportsMarket(m) {
   if (!m || typeof m.ticker !== "string") return false;
-  return m.ticker.startsWith(TICKER_PREFIX) || m.ticker.startsWith("KXMVECROSSCATEGORY");
+
+  const ticker = m.ticker.toUpperCase();
+
+  // Keep current production sports source
+  if (ticker.startsWith(TICKER_PREFIX) || ticker.startsWith("KXMVECROSSCATEGORY")) return true;
+
+  // Also allow canonical direct sports series if present
+  if (/^(KXNBA|KXNFL|KXNHL|KXTENNIS|KXMLB|KXSOCCER)/i.test(ticker)) return true;
+
+  return false;
 }
 
 function isCleanSingleMarket(m) {
   if (!m) return false;
 
-  const title = (m.title || "").toLowerCase();
+  const title = (m.title || "").toLowerCase().trim();
+  const ticker = (m.ticker || "").toUpperCase();
 
-  // Must contain ONLY ONE "yes"
-  const yesMatches = title.match(/yes/g) || [];
-  if (yesMatches.length !== 1) return false;
+  if (!title) return false;
 
-  // Must NOT contain comma (multi selections)
+  // Hard reject obvious combos/parlays
   if (title.includes(",")) return false;
-
-  // Must NOT contain "+"
   if (title.includes("+")) return false;
+  if (ticker.includes("MULTI") || ticker.includes("COMBO") || ticker.includes("PARLAY")) return false;
 
-  // Must NOT be long (combos are long)
-  if (title.length > 80) return false;
+  const yesMatches = title.match(/\byes\b/g) || [];
+  if (yesMatches.length > 1) return false;
+
+  const hasVs = /\bvs\.?\b/.test(title);
+  const hasWillWin = /^will\s+.+\s+win\??$/i.test(title);
+  const hasSingleYesWin = yesMatches.length === 1 && /\bwin\b/.test(title);
+
+  // Allow exactly one clean winner-style structure
+  if (!hasVs && !hasWillWin && !hasSingleYesWin) return false;
+
+  // Reject player/team prop style markets (not match winner markets)
+  if (/\b(points?|rebounds?|assists?|yards?|touchdowns?|strikeouts?|threes?|goals?\s+scored|over\/?under|total|at least|or more|\d+\+)\b/i.test(title)) {
+    return false;
+  }
+
+  if (title.length > 120) return false;
+
+  if (hasVs) {
+    const sides = title.split(/\bvs\.?\b/).map((s) => s.trim()).filter(Boolean);
+    if (sides.length !== 2) return false;
+    if (sides[0].length < 2 || sides[1].length < 2) return false;
+  }
 
   return true;
 }
