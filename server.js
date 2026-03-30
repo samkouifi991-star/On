@@ -1,4 +1,4 @@
-import express from "express";
+aimport express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import fs from "fs";
@@ -14,8 +14,9 @@ const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 const POLL_INTERVAL = 8000;            // full discovery cycle (8s — rate-limit safe)
 const BOOK_BATCH_DELAY = 250;          // 250ms between orderbook fetches
 const DISCOVERY_INTERVAL = 2 * 60 * 1000; // re-discover every 2 min
-const MAX_DISCOVERY_PAGES = 15;
-const FETCH_CONCURRENCY = 3;           // reduced from 6 to avoid 429s
+const MAX_DISCOVERY_PAGES = 12;
+const DISCOVERY_PAGE_SIZE = 1000;      // use large pages to reduce request count
+const FETCH_CONCURRENCY = 3;           // reduced to avoid 429s
 const PORT = process.env.PORT || 3001;
 
 // Tennis ticker prefixes
@@ -105,7 +106,8 @@ let priceHistory = {};
 const HISTORY_LENGTH = 10;
 let lastDiscoveryTime = 0;
 let discoveredTennisMarkets = []; // raw market objects from discovery
-let discoveryStats = { total: 0, tennisFound: 0, liveDisplayed: 0 };
+let discoveryStats = { total: 0, tennisDirect: 0, tennisAssociated: 0, tennisUnique: 0, tennisLive: 0, liveDisplayed: 0 };
+const marketMetaCache = new Map();
 const startTime = Date.now();
 
 // ============================================================
@@ -158,19 +160,24 @@ function isCleanSingleMatch(m) {
   const title = (m.title || "").toLowerCase();
   const ticker = (m.ticker || "").toUpperCase();
 
-  // Reject combos/parlays
   if (title.includes(",") || title.includes("+")) return false;
   if (ticker.includes("MULTI") || ticker.includes("COMBO") || ticker.includes("PARLAY")) return false;
-
-  // Reject props
   if (/\b(points?|rebounds?|assists?|over\/?under|total|at least|or more|\d+\+)\b/i.test(title)) return false;
 
-  // Must have match-like pattern
-  const hasVs = /\bvs\.?\b/i.test(m.title || "");
-  const hasWillWin = /\bwill\b.*\bwin\b/i.test(title);
-  const hasMatch = /\bmatch\b/i.test(title);
+  return true;
+}
 
-  return hasVs || hasWillWin || hasMatch;
+function extractAssociatedTickers(m) {
+  const customStrike = m?.custom_strike || {};
+  return String(customStrike["Associated Markets"] || "")
+    .split(",")
+    .map((ticker) => ticker.trim())
+    .filter(Boolean);
+}
+
+function isTennisTicker(ticker) {
+  const upper = String(ticker || "").toUpperCase();
+  return TENNIS_PREFIXES.some((p) => upper.startsWith(p));
 }
 
 function bestBookPrice(levels) {
@@ -231,22 +238,38 @@ function normalizeMarket(m) {
 // ============================================================
 async function discoverTennisMarkets() {
   const allMarkets = [];
+  const associatedTennisTickers = new Set();
+  const directTennisMarkets = [];
   let cursor = null;
 
   for (let page = 0; page < MAX_DISCOVERY_PAGES; page++) {
     try {
-      const params = new URLSearchParams({ limit: "200", status: "open" });
+      const params = new URLSearchParams({ limit: String(DISCOVERY_PAGE_SIZE), status: "open" });
       if (cursor) params.set("cursor", cursor);
 
       const data = await kalshiFetch(`/markets?${params.toString()}`);
       const batch = data.markets || [];
       allMarkets.push(...batch);
 
+      for (const market of batch) {
+        if (isTennisMarket(market)) {
+          directTennisMarkets.push(market);
+          marketMetaCache.set(market.ticker, market);
+        }
+
+        for (const ticker of extractAssociatedTickers(market)) {
+          if (isTennisTicker(ticker)) {
+            associatedTennisTickers.add(ticker);
+          }
+        }
+      }
+
       cursor = data.cursor;
+      console.log(`[DISCOVERY] Page ${page + 1}: fetched ${batch.length} markets | direct tennis ${directTennisMarkets.length} | associated tennis tickers ${associatedTennisTickers.size}`);
       if (!cursor || batch.length === 0) break;
-      await sleep(400); // rate-limit safe delay between pages
+      await sleep(600);
     } catch (err) {
-      console.warn(`[DISCOVERY] Page ${page} error: ${err.message}`);
+      console.warn(`[DISCOVERY] Page ${page + 1} error: ${err.message}`);
       if (err.message.includes("429")) {
         await sleep(45000);
       }
@@ -255,32 +278,48 @@ async function discoverTennisMarkets() {
   }
 
   console.log(`[DISCOVERY] Fetched ${allMarkets.length} total markets from API`);
+  console.log(`[DISCOVERY] Detected ${directTennisMarkets.length} direct tennis markets`);
+  console.log(`[DISCOVERY] Detected ${associatedTennisTickers.size} associated tennis tickers`);
 
-  // Filter: ONLY tennis + live + clean single match
-  const tennisOnly = allMarkets.filter(m =>
-    isTennisMarket(m) && isLiveMarket(m) && isCleanSingleMatch(m)
-  );
+  const uniqueTickers = Array.from(new Set([
+    ...directTennisMarkets.map((m) => m.ticker),
+    ...associatedTennisTickers,
+  ]));
 
-  console.log(`[DISCOVERY] Found ${tennisOnly.length} live tennis match markets`);
-
-  // Also log what we rejected
-  const tennisAll = allMarkets.filter(isTennisMarket);
-  const tennisLive = tennisAll.filter(isLiveMarket);
-  const tennisRejected = tennisLive.filter(m => !isCleanSingleMatch(m));
-  if (tennisRejected.length > 0) {
-    console.log(`[DISCOVERY] Rejected ${tennisRejected.length} non-match tennis markets: ${tennisRejected.slice(0, 3).map(m => m.title).join(" | ")}`);
+  const resolvedMarkets = [];
+  for (const ticker of uniqueTickers) {
+    try {
+      let market = marketMetaCache.get(ticker);
+      if (!market) {
+        const data = await kalshiFetch(`/markets/${ticker}`);
+        market = data.market || data;
+        if (market?.ticker) marketMetaCache.set(ticker, market);
+      }
+      if (market?.ticker && isTennisMarket(market)) {
+        resolvedMarkets.push(market);
+      }
+      await sleep(120);
+    } catch (err) {
+      console.warn(`[DISCOVERY] Could not resolve ${ticker}: ${err.message}`);
+      if (err.message.includes("429")) await sleep(45000);
+    }
   }
 
-  discoveredTennisMarkets = tennisOnly;
+  const tennisLive = resolvedMarkets.filter((m) => isLiveMarket(m));
+  console.log(`[DISCOVERY] Detected ${tennisLive.length} LIVE tennis markets`);
+
+  discoveredTennisMarkets = tennisLive;
   lastDiscoveryTime = Date.now();
   discoveryStats = {
     total: allMarkets.length,
-    tennisFound: tennisOnly.length,
-    tennisAll: tennisAll.length,
+    tennisDirect: directTennisMarkets.length,
+    tennisAssociated: associatedTennisTickers.size,
+    tennisUnique: resolvedMarkets.length,
     tennisLive: tennisLive.length,
+    liveDisplayed: markets.length,
   };
 
-  return tennisOnly;
+  return tennisLive;
 }
 
 // ============================================================
