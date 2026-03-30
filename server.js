@@ -12,7 +12,7 @@ app.use(express.json());
 // ============================================================
 const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 const TICKER_PREFIX = "KXMVESPORTSMULTIGAMEEXTENDED";
-const POLL_INTERVAL = 15000; // 15s to avoid 429s
+const POLL_INTERVAL = 15000;
 const PORT = process.env.PORT || 3001;
 
 // ============================================================
@@ -64,7 +64,6 @@ async function kalshiFetch(path) {
 
   const res = await fetch(`${KALSHI_BASE}${path}`, { headers });
 
-  // Rate limit backoff
   if (res.status === 429) {
     console.warn("[RATE LIMIT] 429 — backing off 30s");
     await new Promise((r) => setTimeout(r, 30000));
@@ -86,28 +85,24 @@ let opportunities = [];
 let lastScan = 0;
 let scanCount = 0;
 let previousPrices = {};
-let peakPrices = {};       // Track peak price per ticker
-let lastSignalTime = {};   // Cooldown tracker per ticker
+let peakPrices = {};
 let lastFetchTime = 0;
 const startTime = Date.now();
 
 // ============================================================
-// FILTERS
+// HELPERS
 // ============================================================
-// Helper: parse dollar string to cents (integer)
 function dollarsToCents(val) {
   if (typeof val === "number") return Math.round(val * 100);
   const n = parseFloat(val);
   return isNaN(n) ? 0 : Math.round(n * 100);
 }
 
-// Helper: parse volume string to number
 function parseVolume(m) {
   const v = m.volume || m.volume_fp || m.volume_24h_fp || "0";
   return typeof v === "number" ? v : parseFloat(v) || 0;
 }
 
-// Helper: extract cent prices from API market object
 function extractPrices(m) {
   return {
     yes_bid: dollarsToCents(m.yes_bid_dollars || m.yes_bid || 0),
@@ -125,13 +120,31 @@ function isSportsMarket(m) {
   return m.ticker.startsWith(TICKER_PREFIX) || m.ticker.startsWith("KXMVECROSSCATEGORY");
 }
 
-// Combo markets are ONE-SIDED: yes_bid is almost always 0.
-// We accept any market that has a yes_ask price (the real price).
+function isCleanSingleMarket(m) {
+  if (!m) return false;
+
+  const title = (m.title || "").toLowerCase();
+
+  // Must contain ONLY ONE "yes"
+  const yesMatches = title.match(/yes/g) || [];
+  if (yesMatches.length !== 1) return false;
+
+  // Must NOT contain comma (multi selections)
+  if (title.includes(",")) return false;
+
+  // Must NOT contain "+"
+  if (title.includes("+")) return false;
+
+  // Must NOT be long (combos are long)
+  if (title.length > 80) return false;
+
+  return true;
+}
+
 function isTradableMarket(m) {
   if (!m) return false;
   const p = extractPrices(m);
   const price = p.yes_ask || p.last_price || p.prev_price;
-  // Accept if there's any meaningful price data
   return price > 0;
 }
 
@@ -142,7 +155,6 @@ function classifySport(title, ticker) {
   if (/kxnhl|nhl|hockey|rangers|bruins|oilers|avalanche|hurricanes|stars|maple leafs|canadiens|lightning|penguins|capitals|flames|senators|kraken|blue jackets|sabres|red wings|islanders|devils|wild|predators|canucks|ducks|coyotes|sharks|blues|blackhawks|flyers|goals scored/i.test(t)) return "NHL";
   if (/kxtennis|tennis|atp|wta|djokovic|sinner|alcaraz|medvedev|zverev|rublev|tsitsipas|ruud|fritz|swiatek|sabalenka|gauff|rybakina|pegula|halys|schwaerzler|navone|shevchenko|tirante|vallejo|vukic|udvardy|merida|hurkacz|roland|french|wimbledon/i.test(t)) return "TENNIS";
   if (/kxmlb|mlb|baseball|yankees|red sox|dodgers|mets|cubs|braves|astros|phillies|padres|mariners|orioles|guardians|twins|royals|brewers|diamondbacks|reds|pirates|rays|blue jays|angels|athletics|marlins|nationals|rockies|white sox|tigers|cardinals|cincinnati|tampa bay|kansas city|new york y|new york m|arizona|colorado|san francisco|san diego|seattle|baltimore|st\. louis|runs scored|stanton|judge/i.test(t)) return "MLB";
-  // Fallback: check custom_strike Associated Events for sport prefixes
   return "OTHER";
 }
 
@@ -152,10 +164,8 @@ function normalizeMarket(m) {
   const associatedEvents = customStrike["Associated Events"] || "";
   const sport = classifySport((m.title || m.ticker) + " " + associatedEvents, m.ticker);
 
-  // For one-sided combo markets: yes_ask IS the price
   const price = p.yes_ask || p.last_price || p.prev_price || 0;
   const prev = previousPrices[m.ticker] ?? price;
-  // Spread only meaningful when both sides exist
   const spread = (p.yes_ask && p.yes_bid) ? p.yes_ask - p.yes_bid : 0;
 
   return {
@@ -177,54 +187,90 @@ function normalizeMarket(m) {
 }
 
 // ============================================================
-// SIGNAL ENGINE v5 — FAVORITE COMEBACK DETECTOR (strict filters)
+// SIGNAL ENGINE v6 — TIERED COMEBACK DETECTOR
 // ============================================================
-// Only detects high-quality comeback setups:
-//   1. Strong favorite (peak ≥ 65¢)
-//   2. Large panic drop (≥ 20¢ from peak)
-//   3. Price in recovery zone (20-70¢)
-//   4. Liquidity confirmed (volume ≥ 100, spread ≤ 5¢)
-//   5. Stabilizing or recovering (not still falling)
-//   6. 60s cooldown per market (prevent spam)
+// Produces WEAK / NORMAL / STRONG signals using a scoring system.
+// Base filters are relaxed (peak >= 60¢, drop >= 10¢) so signals
+// are always present. Quality is ranked by score 0-100.
 // ============================================================
 
-const SIGNAL_COOLDOWN_MS = 60000; // 60 seconds
-
-function isComebackOpportunity(m) {
-  if (!m) return false;
+function getComebackSignal(m) {
+  if (!m) return null;
 
   const peak = peakPrices[m.ticker] || m.price;
   const price = m.price;
   const prev = m.prev;
 
-  // FAVORITE FILTER: peak must have been a strong favorite
-  if (peak < 65) return false;
+  // Base filter: peak must have been a favorite
+  if (peak < 60) return null;
 
-  // PANIC DROP: must have dropped at least 20¢ from peak
   const drop = peak - price;
-  if (drop < 20) return false;
+  if (drop < 10) return null;
 
-  // PRICE ZONE: avoid dead or already recovered markets
-  if (price < 20 || price > 70) return false;
+  // Price zone filter
+  if (price < 15 || price > 85) return null;
 
-  // LIQUIDITY: must have real trading activity
-  if (m.volume < 100) return false;
-  if (m.spread > 5) return false;
-
-  // STABILIZATION / RECOVERY: price must not still be falling
   const stabilizing = Math.abs(price - prev) < 2;
   const recovering = price > prev;
-  if (!(stabilizing || recovering)) return false;
 
-  // COOLDOWN: don't signal same market within 60s
-  const lastSignal = lastSignalTime[m.ticker] || 0;
-  if (Date.now() - lastSignal < SIGNAL_COOLDOWN_MS) return false;
+  // --- Scoring system (0-100) ---
+  let score = 0;
 
-  return true;
+  // Drop strength
+  if (drop >= 20) score += 40;
+  else if (drop >= 15) score += 25;
+  else score += 10;
+
+  // Recovery behavior
+  if (recovering) score += 30;
+  else if (stabilizing) score += 15;
+
+  // Liquidity quality (bonuses)
+  if (m.volume >= 100) score += 15;
+  if (m.spread <= 5) score += 15;
+
+  // Late game penalty (soft — reduces score, doesn't block)
+  // We can't get real quarter/time from Kalshi API, so we skip
+  // hard game-state checks. The penalty is available for future use.
+
+  // Liquidity penalties
+  if (m.volume < 50) score -= 20;
+  if (m.spread > 7) score -= 20;
+
+  // Clamp score
+  score = Math.max(0, Math.min(100, score));
+
+  // Determine level
+  let level = "WEAK";
+  if (score >= 70) level = "STRONG";
+  else if (score >= 40) level = "NORMAL";
+
+  return {
+    id: `${m.ticker}-comeback-${Date.now()}`,
+    type: "COMEBACK",
+    match: m.match,
+    sport: m.sport,
+    ticker: m.ticker,
+    price,
+    prev,
+    edge: drop,
+    direction: "YES",
+    timestamp: Date.now(),
+    description: `Peaked at ${peak}¢, dropped ${drop}¢ to ${price}¢ — ${recovering ? "recovering" : stabilizing ? "stabilizing" : "falling"}`,
+    strength: level,
+    score,
+    action: "BUY",
+    peakPrice: peak,
+    dropSize: drop,
+    recovering,
+    volume: m.volume,
+    spread: m.spread,
+  };
 }
 
 function detectOpportunities(currentMarkets) {
   const newOpps = [];
+  const seen = new Set();
 
   for (const m of currentMarkets) {
     if (m.price <= 0) continue;
@@ -235,65 +281,38 @@ function detectOpportunities(currentMarkets) {
       peakPrices[m.ticker] = m.price;
     }
 
-    // Skip first scan (no baseline)
+    // Update peak from prev too
     const prev = previousPrices[m.ticker];
-    if (prev === undefined) continue;
-
-    // Update peak from historical data too
-    if (prev > (peakPrices[m.ticker] || 0)) {
+    if (prev !== undefined && prev > (peakPrices[m.ticker] || 0)) {
       peakPrices[m.ticker] = prev;
     }
 
-    if (!isComebackOpportunity(m)) continue;
+    const signal = getComebackSignal(m);
+    if (!signal) continue;
 
-    const peak = peakPrices[m.ticker];
-    const drop = peak - m.price;
-    const recovering = m.price > prev;
+    // Deduplicate by ticker (keep highest score)
+    if (seen.has(m.ticker)) continue;
+    seen.add(m.ticker);
 
-    // Record signal time for cooldown
-    lastSignalTime[m.ticker] = Date.now();
-
-    newOpps.push({
-      id: `${m.ticker}-comeback-${Date.now()}`,
-      type: "COMEBACK",
-      match: m.match,
-      sport: m.sport,
-      ticker: m.ticker,
-      price: m.price,
-      prev,
-      edge: drop,
-      direction: "YES",
-      timestamp: Date.now(),
-      description: `Favorite comeback: peaked at ${peak}¢, dropped ${drop}¢ to ${m.price}¢ — ${recovering ? "recovering" : "stabilizing"}`,
-      strength: drop >= 30 ? "STRONG" : "MODERATE",
-      peakPrice: peak,
-      dropSize: drop,
-      recovering,
-      action: "BUY",
-      volume: m.volume,
-      spread: m.spread,
-    });
+    newOpps.push(signal);
   }
 
+  // Sort by score descending
+  newOpps.sort((a, b) => b.score - a.score);
   return newOpps;
 }
 
 // ============================================================
-// MARKET FETCHING — with cache + backoff
+// MARKET FETCHING
 // ============================================================
 async function fetchAllMarkets() {
   const now = Date.now();
-
-  // Cache guard — don't re-fetch within interval
-  if (now - lastFetchTime < POLL_INTERVAL - 1000) {
-    return;
-  }
+  if (now - lastFetchTime < POLL_INTERVAL - 1000) return;
 
   const allMarkets = [];
   let cursor = null;
 
   try {
-    // Fetch max 10 pages (2000 markets) to capture sports markets
     for (let page = 0; page < 10; page++) {
       const params = new URLSearchParams({ limit: "200", status: "open" });
       if (cursor) params.set("cursor", cursor);
@@ -304,24 +323,25 @@ async function fetchAllMarkets() {
 
       cursor = data.cursor;
       if (!cursor || batch.length === 0) break;
-
-      // Small delay between pages to avoid burst rate limits
       if (cursor) await new Promise((r) => setTimeout(r, 500));
     }
 
     lastFetchTime = Date.now();
 
-    // Filter: sports → has price → normalize → cap at 500
     const sportsMarkets = allMarkets.filter(isSportsMarket);
-    const tradable = sportsMarkets.filter(isTradableMarket);
-    const normalized = tradable.slice(0, 500).map(normalizeMarket);
+    const cleanMarkets = sportsMarkets
+      .filter(isCleanSingleMarket)
+      .filter(isTradableMarket);
 
-    // Keep NBA, NFL, NHL, TENNIS, MLB (drop only unclassified OTHER)
+    console.log("Sample clean markets:", cleanMarkets.slice(0, 5));
+
+    const normalized = cleanMarkets.slice(0, 500).map(normalizeMarket);
+
     const filtered = normalized.filter(
       (m) => ["NBA", "NFL", "NHL", "TENNIS", "MLB"].includes(m.sport)
     );
 
-    // Detect opportunities before updating prices
+    // Detect opportunities BEFORE updating prices
     const newOpps = detectOpportunities(filtered);
 
     // Update previous prices AFTER detection
@@ -329,8 +349,18 @@ async function fetchAllMarkets() {
       previousPrices[m.ticker] = m.price;
     }
 
-    // Keep last 20 opportunities (fewer, higher quality)
-    opportunities = [...newOpps, ...opportunities].slice(0, 20);
+    // Merge: new signals first, then keep recent old ones, cap at 50
+    // Deduplicate by ticker — keep newest
+    const tickerMap = new Map();
+    for (const opp of [...newOpps, ...opportunities]) {
+      if (!tickerMap.has(opp.ticker)) {
+        tickerMap.set(opp.ticker, opp);
+      }
+    }
+    opportunities = Array.from(tickerMap.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 50);
+
     markets = filtered;
     lastScan = Date.now();
     scanCount++;
@@ -340,8 +370,13 @@ async function fetchAllMarkets() {
       sportCounts[m.sport] = (sportCounts[m.sport] || 0) + 1;
     });
 
+    const levelCounts = { STRONG: 0, NORMAL: 0, WEAK: 0 };
+    opportunities.forEach((o) => {
+      levelCounts[o.strength] = (levelCounts[o.strength] || 0) + 1;
+    });
+
     console.log(
-      `[SCAN #${scanCount}] ${allMarkets.length} total → ${sportsMarkets.length} sports → ${tradable.length} priced → ${filtered.length} tracked | NewOpps: ${newOpps.length} TotalOpps: ${opportunities.length} | Sports: ${JSON.stringify(sportCounts)}`
+      `[SCAN #${scanCount}] ${allMarkets.length} total → ${sportsMarkets.length} sports → ${cleanMarkets.length} clean+tradable → ${filtered.length} tracked | Signals: ${opportunities.length} (S:${levelCounts.STRONG} N:${levelCounts.NORMAL} W:${levelCounts.WEAK}) | Sports: ${JSON.stringify(sportCounts)}`
     );
   } catch (err) {
     console.error("[SCAN ERROR]", err.message);
@@ -365,6 +400,11 @@ app.get("/api/status", (req, res) => {
     sportCounts[m.sport] = (sportCounts[m.sport] || 0) + 1;
   });
 
+  const levelCounts = { STRONG: 0, NORMAL: 0, WEAK: 0 };
+  opportunities.forEach((o) => {
+    levelCounts[o.strength] = (levelCounts[o.strength] || 0) + 1;
+  });
+
   res.json({
     connected: markets.length > 0 || scanCount > 0,
     lastScan,
@@ -372,6 +412,7 @@ app.get("/api/status", (req, res) => {
     activeOpportunities: opportunities.length,
     sports: sportCounts,
     totalSignals: opportunities.length,
+    signalLevels: levelCounts,
     uptime: (Date.now() - startTime) / 1000,
   });
 });
@@ -383,7 +424,6 @@ app.get("/api/debug", (req, res) => {
     prev: m.prev,
     yes_ask: m.yes_ask,
     yes_bid: m.yes_bid,
-    no_ask: m.no_ask,
     volume: m.volume,
     sport: m.sport,
   }));
@@ -404,11 +444,10 @@ app.get("/health", (req, res) => {
 // START
 // ============================================================
 console.log("=".repeat(60));
-console.log("  KALSHI EDGE SCANNER — LIVE BACKEND v5.0 (comeback-only)");
-console.log("  Signal Mode: FAVORITE COMEBACK DETECTOR (strict)");
+console.log("  KALSHI EDGE SCANNER v6.0 — TIERED COMEBACK DETECTOR");
+console.log("  Signal Levels: WEAK | NORMAL | STRONG (scored 0-100)");
 console.log(`  API Key: ${API_KEY_ID ? "✓ configured" : "✗ missing KALSHI_API_KEY"}`);
 console.log(`  Private Key: ${PRIVATE_KEY ? "✓ loaded" : "✗ missing PEM file"}`);
-console.log(`  Ticker Filter: ${TICKER_PREFIX}`);
 console.log(`  Poll Interval: ${POLL_INTERVAL}ms`);
 console.log("=".repeat(60));
 
