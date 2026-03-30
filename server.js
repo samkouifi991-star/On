@@ -14,99 +14,72 @@ let liveMarkets = [];
 let signals = [];
 const peaks = {};
 
-// ── Step 1: Fetch tennis markets ──
-async function fetchTennisMarkets() {
-  const allMarkets = [];
-
-  // Search with multiple tennis-related terms
-  const searches = ["KXATP", "KXWTA"];
-
-  for (const term of searches) {
-    try {
-      let cursor = null;
-      let hasMore = true;
-
-      while (hasMore) {
-        let url = `${KALSHI_API}/markets?limit=100&status=active&ticker=${term}`;
-        if (cursor) url += `&cursor=${cursor}`;
-
-        const res = await fetch(url, {
-          headers: { "Accept": "application/json" }
-        });
-
-        if (!res.ok) {
-          console.error(`[FETCH] ${term}: API returned ${res.status}`);
-          break;
-        }
-
-        const data = await res.json();
-        const markets = data.markets || [];
-        allMarkets.push(...markets);
-
-        cursor = data.cursor;
-        hasMore = cursor && markets.length === 100;
-
-        // Small delay to avoid rate limits
-        if (hasMore) await sleep(200);
-      }
-    } catch (err) {
-      console.error(`[FETCH] ${term} error:`, err.message);
-    }
-  }
-
-  // Also try event-based search
-  try {
-    const res = await fetch(`${KALSHI_API}/events?status=open&series_ticker=KXATP&limit=100`, {
-      headers: { "Accept": "application/json" }
-    });
-    if (res.ok) {
-      const data = await res.json();
-      for (const event of (data.events || [])) {
-        if (event.markets) allMarkets.push(...event.markets);
-      }
-    }
-  } catch (err) {
-    console.error("[FETCH] ATP events error:", err.message);
-  }
-
-  try {
-    const res = await fetch(`${KALSHI_API}/events?status=open&series_ticker=KXWTA&limit=100`, {
-      headers: { "Accept": "application/json" }
-    });
-    if (res.ok) {
-      const data = await res.json();
-      for (const event of (data.events || [])) {
-        if (event.markets) allMarkets.push(...event.markets);
-      }
-    }
-  } catch (err) {
-    console.error("[FETCH] WTA events error:", err.message);
-  }
-
-  // Deduplicate by ticker
-  const seen = new Set();
-  const unique = [];
-  for (const m of allMarkets) {
-    const ticker = m.ticker || "";
-    if (!seen.has(ticker)) {
-      seen.add(ticker);
-      unique.push(m);
-    }
-  }
-
-  console.log(`[FETCH] Found ${unique.length} total tennis markets`);
-  return unique;
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
-// ── Step 2: Filter live only ──
+// ── Step 1: Fetch ALL open markets, then filter tennis locally ──
+async function fetchTennisMarkets() {
+  const allTennis = [];
+  let cursor = null;
+  let pages = 0;
+  const MAX_PAGES = 10;
+
+  try {
+    while (pages < MAX_PAGES) {
+      let url = `${KALSHI_API}/markets?limit=200&status=active`;
+      if (cursor) url += `&cursor=${cursor}`;
+
+      const res = await fetch(url, {
+        headers: { "Accept": "application/json" }
+      });
+
+      if (!res.ok) {
+        console.error(`[FETCH] API returned ${res.status}`);
+        break;
+      }
+
+      const data = await res.json();
+      const markets = data.markets || [];
+
+      // Filter tennis locally
+      for (const m of markets) {
+        const ticker = (m.ticker || "").toUpperCase();
+        const title = (m.title || "").toUpperCase();
+        const eventTicker = (m.event_ticker || "").toUpperCase();
+
+        if (
+          ticker.includes("KXATP") || ticker.includes("KXWTA") ||
+          eventTicker.includes("KXATP") || eventTicker.includes("KXWTA") ||
+          title.includes("ATP") || title.includes("WTA") ||
+          title.includes("TENNIS")
+        ) {
+          allTennis.push(m);
+        }
+      }
+
+      pages++;
+      cursor = data.cursor;
+
+      // Stop if no more pages
+      if (!cursor || markets.length < 200) break;
+
+      // Rate limit protection
+      await sleep(250);
+    }
+  } catch (err) {
+    console.error("[FETCH] Error:", err.message);
+  }
+
+  console.log(`[FETCH] Scanned ${pages} pages, found ${allTennis.length} tennis markets`);
+  return allTennis;
+}
+
+// ── Step 2: Keep only live/active ──
 function filterLive(markets) {
   return markets.filter(m => {
     const status = (m.status || "").toLowerCase();
-    const ticker = (m.ticker || "").toUpperCase();
-    // Accept active/open/live markets with tennis tickers
-    const isTennis = ticker.includes("KXATP") || ticker.includes("KXWTA");
-    const isLive = status === "active" || status === "open" || status === "live";
-    return isTennis && isLive;
+    return status === "active" || status === "open" || status === "live";
   });
 }
 
@@ -139,7 +112,7 @@ function detectSignals(markets) {
 
       results.push({
         ticker: m.ticker,
-        title: m.title || m.subtitle || m.ticker,
+        title: m.title || m.ticker,
         price: m.currentPrice,
         peak: m.peak,
         drop: m.drop,
@@ -153,10 +126,6 @@ function detectSignals(markets) {
   return results;
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 // ── Scanner loop ──
 async function scan() {
   console.log("[SCAN] Fetching markets...");
@@ -168,7 +137,7 @@ async function scan() {
 
   liveMarkets = live.map(m => ({
     ticker: m.ticker,
-    title: m.title || m.subtitle || m.ticker,
+    title: m.title || m.ticker,
     price: m.currentPrice,
     peak: m.peak,
     drop: m.drop,
