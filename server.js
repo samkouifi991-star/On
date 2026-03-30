@@ -222,6 +222,15 @@ function normalizeMarket(m) {
   const prev = previousPrices[m.ticker] ?? price;
   const spread = (p.yes_ask && p.yes_bid) ? p.yes_ask - p.yes_bid : 0;
 
+  // Seed peak from all available price sources on first observation
+  if (!peakPrices[m.ticker]) {
+    const seedPeak = Math.max(price, prev, p.last_price || 0, p.prev_price || 0);
+    if (seedPeak > 0) {
+      peakPrices[m.ticker] = seedPeak;
+      console.log(`[PEAK] Seeded ${m.ticker}: peak=${seedPeak}¢ (price=${price}, prev=${prev}, last=${p.last_price}, prevPrice=${p.prev_price})`);
+    }
+  }
+
   return {
     ticker: m.ticker,
     title: displayTitle,
@@ -702,6 +711,23 @@ app.get("/api/discovery-debug", (req, res) => {
     trackedUniverseSize: trackedMarketUniverse.length,
     trackedSample: trackedMarketUniverse.slice(0, 10).map(m => ({ ticker: m.ticker, title: (m.title || "").slice(0, 80) })),
     ...discoveryDebug,
+  });
+});
+
+app.get("/api/peaks-debug", (req, res) => {
+  const peakEntries = Object.entries(peakPrices).map(([ticker, peak]) => {
+    const market = markets.find(m => m.ticker === ticker);
+    const currentPrice = market ? market.price : null;
+    const drop = currentPrice !== null ? peak - currentPrice : null;
+    return { ticker, peak, currentPrice, drop, wouldSignal: peak >= 60 && drop >= 10 && currentPrice >= 15 && currentPrice <= 85 };
+  });
+  peakEntries.sort((a, b) => (b.drop || 0) - (a.drop || 0));
+  res.json({
+    totalPeaksTracked: Object.keys(peakPrices).length,
+    totalMarkets: markets.length,
+    scanCount,
+    uptimeSeconds: Math.round((Date.now() - startTime) / 1000),
+    peaks: peakEntries,
   });
 });
 
