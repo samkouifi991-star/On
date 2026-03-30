@@ -473,8 +473,8 @@ async function hydrateTrackedMarkets() {
 // SIGNAL ENGINE v6 — TIERED COMEBACK DETECTOR
 // ============================================================
 // Produces WEAK / NORMAL / STRONG signals using a scoring system.
-// Base filters are relaxed (peak >= 60¢, drop >= 10¢) so signals
-// are always present. Quality is ranked by score 0-100.
+// Base filters: peak >= 55¢, drop >= 5¢, volume >= 1000
+// Signal tiers: WEAK (drop>=5), NORMAL (drop>=7), STRONG (drop>=10)
 // ============================================================
 
 function getComebackSignal(m) {
@@ -485,13 +485,16 @@ function getComebackSignal(m) {
   const prev = m.prev;
 
   // Base filter: peak must have been a favorite
-  if (peak < 60) return null;
+  if (peak < 55) return null;
 
   const drop = peak - price;
-  if (drop < 10) return null;
+  if (drop < 5) return null;
 
   // Price zone filter
   if (price < 15 || price > 85) return null;
+
+  // Volume filter — must have liquidity
+  if (m.volume < 1000) return null;
 
   const stabilizing = Math.abs(price - prev) < 2;
   const recovering = price > prev;
@@ -499,34 +502,32 @@ function getComebackSignal(m) {
   // --- Scoring system (0-100) ---
   let score = 0;
 
-  // Drop strength
+  // Drop strength (dynamic tiers)
   if (drop >= 20) score += 40;
-  else if (drop >= 15) score += 25;
-  else score += 10;
+  else if (drop >= 15) score += 30;
+  else if (drop >= 10) score += 20;
+  else if (drop >= 7) score += 12;
+  else score += 5; // drop >= 5
 
   // Recovery behavior
   if (recovering) score += 30;
   else if (stabilizing) score += 15;
 
   // Liquidity quality (bonuses)
-  if (m.volume >= 100) score += 15;
+  if (m.volume >= 5000) score += 15;
+  else if (m.volume >= 2000) score += 10;
   if (m.spread <= 5) score += 15;
 
-  // Late game penalty (soft — reduces score, doesn't block)
-  // We can't get real quarter/time from Kalshi API, so we skip
-  // hard game-state checks. The penalty is available for future use.
-
   // Liquidity penalties
-  if (m.volume < 50) score -= 20;
   if (m.spread > 7) score -= 20;
 
   // Clamp score
   score = Math.max(0, Math.min(100, score));
 
-  // Determine level
+  // Determine level based on drop size AND score
   let level = "WEAK";
-  if (score >= 70) level = "STRONG";
-  else if (score >= 40) level = "NORMAL";
+  if (drop >= 10 && score >= 70) level = "STRONG";
+  else if (drop >= 7 && score >= 40) level = "NORMAL";
 
   return {
     id: `${m.ticker}-comeback-${Date.now()}`,
@@ -719,7 +720,8 @@ app.get("/api/peaks-debug", (req, res) => {
     const market = markets.find(m => m.ticker === ticker);
     const currentPrice = market ? market.price : null;
     const drop = currentPrice !== null ? peak - currentPrice : null;
-    return { ticker, peak, currentPrice, drop, wouldSignal: peak >= 60 && drop >= 10 && currentPrice >= 15 && currentPrice <= 85 };
+    const volume = market ? market.volume : null;
+    return { ticker, peak, currentPrice, drop, volume, wouldSignal: peak >= 55 && drop >= 5 && currentPrice >= 15 && currentPrice <= 85 && volume >= 1000 };
   });
   peakEntries.sort((a, b) => (b.drop || 0) - (a.drop || 0));
   res.json({
