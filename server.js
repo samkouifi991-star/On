@@ -12,11 +12,13 @@ app.use(express.json());
 // ============================================================
 const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 const TICKER_PREFIX = "KXMVESPORTSMULTIGAMEEXTENDED";
-const POLL_INTERVAL = 15000;
-const DISCOVERY_INTERVAL = 5 * 60 * 1000;
-const MAX_DISCOVERY_PAGES = 10;
-const MAX_TRACKED_MARKETS = 60;
-const FETCH_CONCURRENCY = 4;
+const POLL_INTERVAL = 5000;           // base poll for all markets
+const FAST_POLL_INTERVAL = 2000;      // priority markets (top 30)
+const DISCOVERY_INTERVAL = 3 * 60 * 1000; // re-discover every 3 min
+const MAX_DISCOVERY_PAGES = 15;       // scan more pages
+const MAX_TRACKED_MARKETS = 200;      // no artificial cap
+const FETCH_CONCURRENCY = 6;
+const PRIORITY_TIER_SIZE = 30;        // top N markets get fast polling
 const PORT = process.env.PORT || 3001;
 
 // ============================================================
@@ -93,10 +95,122 @@ let peakPrices = {};
 let priceHistory = {};       // ticker → [last N prices] for momentum
 const HISTORY_LENGTH = 10;
 let lastFetchTime = 0;
+let lastFastFetchTime = 0;   // for priority tier
 let lastDiscoveryTime = 0;
 let trackedMarketUniverse = [];
+let priorityTickers = new Set(); // top markets for fast polling
 let discoveryStats = { total: 0, sports: 0, discovered: 0 };
 let discoveryDebug = { sampleTitles: [], rejectedSamples: [], directCandidateSamples: [], filterReasons: {} };
+const startTime = Date.now();
+const marketMetaCache = new Map();
+
+// ============================================================
+// SPORT-SPECIFIC CONFIG
+// ============================================================
+const SPORT_CONFIG = {
+  TENNIS: {
+    peakThreshold: 50,
+    minDrop: 3,
+    weakDrop: 3, normalDrop: 5, strongDrop: 8,
+    requireStabilization: false,
+    priorityBoost: 20,   // tennis gets priority boost
+    minVolume: 500,       // tennis can have lower volume
+  },
+  NBA: {
+    peakThreshold: 55,
+    minDrop: 5,
+    weakDrop: 5, normalDrop: 8, strongDrop: 12,
+    requireStabilization: true,
+    priorityBoost: 10,
+    minVolume: 1000,
+  },
+  NFL: {
+    peakThreshold: 55,
+    minDrop: 5,
+    weakDrop: 5, normalDrop: 8, strongDrop: 12,
+    requireStabilization: true,
+    priorityBoost: 10,
+    minVolume: 1000,
+  },
+  NHL: {
+    peakThreshold: 52,
+    minDrop: 4,
+    weakDrop: 4, normalDrop: 6, strongDrop: 10,
+    requireStabilization: false,
+    priorityBoost: 5,
+    minVolume: 800,
+  },
+  MLB: {
+    peakThreshold: 52,
+    minDrop: 4,
+    weakDrop: 4, normalDrop: 6, strongDrop: 10,
+    requireStabilization: false,
+    priorityBoost: 5,
+    minVolume: 800,
+  },
+};
+
+function getSportConfig(sport) {
+  return SPORT_CONFIG[sport] || SPORT_CONFIG.NBA; // default to NBA rules
+}
+
+// ============================================================
+// PRIORITY SCORING — determines which markets get fast-polled
+// ============================================================
+function calculatePriorityScore(m) {
+  const cfg = getSportConfig(m.sport);
+  let score = 0;
+
+  // Sport-specific boost
+  score += cfg.priorityBoost;
+
+  // Volume: higher = more important
+  if (m.volume >= 5000) score += 30;
+  else if (m.volume >= 2000) score += 20;
+  else if (m.volume >= 1000) score += 10;
+
+  // Price movement speed (recent change)
+  const move = Math.abs(m.price - m.prev);
+  if (move >= 5) score += 25;
+  else if (move >= 3) score += 15;
+  else if (move >= 1) score += 5;
+
+  // Drop from peak (comeback candidate gets priority)
+  const peak = peakPrices[m.ticker] || m.price;
+  const drop = peak - m.price;
+  if (drop >= cfg.strongDrop) score += 30;
+  else if (drop >= cfg.normalDrop) score += 20;
+  else if (drop >= cfg.minDrop) score += 10;
+
+  // Wide spread = instability = interesting
+  if (m.spread >= 5) score += 10;
+
+  return score;
+}
+
+// ============================================================
+// COMEBACK CANDIDATE PRE-FILTER — only these get signal logic
+// ============================================================
+function isComebackCandidate(m) {
+  if (!m || m.price <= 0) return false;
+  const cfg = getSportConfig(m.sport);
+  const peak = peakPrices[m.ticker] || m.price;
+  const drop = peak - m.price;
+
+  // Was ever a favorite (peak above threshold)
+  if (peak < cfg.peakThreshold) return false;
+
+  // Has dropped enough from peak
+  if (drop < cfg.minDrop) return false;
+
+  // Still has meaningful price (not settled near 0 or 100)
+  if (m.price < 10 || m.price > 92) return false;
+
+  // Meets sport-specific volume minimum
+  if (m.volume < cfg.minVolume) return false;
+
+  return true;
+}
 const startTime = Date.now();
 const marketMetaCache = new Map();
 
@@ -524,48 +638,51 @@ function getMomentumBoost(ticker) {
 function getComebackSignal(m) {
   if (!m) return null;
 
+  const cfg = getSportConfig(m.sport);
   const peak = peakPrices[m.ticker] || m.price;
   const price = m.price;
   const prev = m.prev;
 
-  if (peak < 55) return null;
-
+  if (peak < cfg.peakThreshold) return null;
   const drop = peak - price;
-  if (drop < 5) return null;
+  if (drop < cfg.minDrop) return null;
+  if (price < 10 || price > 92) return null;
+  if (m.volume < cfg.minVolume) return null;
 
-  if (price < 15 || price > 85) return null;
-  if (m.volume < 1000) return null;
-
-  const stabilizing = Math.abs(price - prev) < 2;
   const recovering = price > prev;
+  const stabilizing = cfg.requireStabilization ? Math.abs(price - prev) < 2 : false;
 
   let score = 0;
 
-  // Drop strength
-  if (drop >= 20) score += 40;
-  else if (drop >= 15) score += 30;
-  else if (drop >= 10) score += 20;
-  else if (drop >= 7) score += 12;
+  // Drop strength — sport-specific
+  if (drop >= cfg.strongDrop * 2) score += 40;
+  else if (drop >= cfg.strongDrop * 1.5) score += 30;
+  else if (drop >= cfg.strongDrop) score += 20;
+  else if (drop >= cfg.normalDrop) score += 12;
   else score += 5;
 
-  // Recovery behavior
   if (recovering) score += 30;
   else if (stabilizing) score += 15;
 
-  // Momentum confirmation
+  // Fast reversal bonus for sports that don't require stabilization
+  if (!cfg.requireStabilization && recovering && drop >= cfg.normalDrop) score += 15;
+
   score += getMomentumBoost(m.ticker);
 
-  // Liquidity bonuses
   if (m.volume >= 5000) score += 15;
   else if (m.volume >= 2000) score += 10;
-  if (m.spread <= 5) score += 15;
-  if (m.spread > 7) score -= 20;
+  if (cfg.requireStabilization) {
+    if (m.spread <= 5) score += 15;
+    if (m.spread > 7) score -= 20;
+  } else {
+    if (m.spread >= 5) score += 10;
+  }
 
   score = Math.max(0, Math.min(100, score));
 
   let level = "WEAK";
-  if (drop >= 10 && score >= 60) level = "STRONG";
-  else if (drop >= 7 && score >= 35) level = "NORMAL";
+  if (drop >= cfg.strongDrop && score >= 50) level = "STRONG";
+  else if (drop >= cfg.normalDrop && score >= 30) level = "NORMAL";
 
   const momentum = getMomentum(m.ticker);
 
@@ -654,16 +771,15 @@ function getTennisSpikeSignal(m) {
   if (m.sport !== "TENNIS") return null;
 
   const price = m.price;
-  if (price < 85) return null;
+  if (price < 75) return null;  // lowered from 85 — catch spikes earlier
   if (m.volume < 1000) return null;
 
-  // Check if pre-game odds were roughly even (prev/seed ≈ 50 ± 10)
-  const seedPrice = peakPrices[m.ticker] ? null : m.prev; // use prev as proxy for pre-game
+  // Check if pre-game odds were roughly even (prev/seed ≈ 50 ± 15)
   const hist = priceHistory[m.ticker];
   const earliestPrice = hist && hist.length > 0 ? hist[0] : m.prev;
 
-  // If the earliest tracked price was near 50/50, this is an overextension
-  const wasEven = earliestPrice >= 40 && earliestPrice <= 60;
+  // Wider "was even" window for tennis (35–65)
+  const wasEven = earliestPrice >= 35 && earliestPrice <= 65;
 
   if (!wasEven) return null;
 
@@ -671,12 +787,18 @@ function getTennisSpikeSignal(m) {
   let score = 30;
 
   if (price >= 95) { level = "STRONG"; score = 85; }
-  else if (price >= 90) { level = "NORMAL"; score = 60; }
-  else { level = "WEAK"; score = 40; }
+  else if (price >= 90) { level = "STRONG"; score = 75; }
+  else if (price >= 85) { level = "NORMAL"; score = 60; }
+  else if (price >= 80) { level = "NORMAL"; score = 50; }
+  else { level = "WEAK"; score = 40; }  // 75-80
 
   // Volume boost
   if (m.volume >= 5000) score += 15;
   else if (m.volume >= 2000) score += 10;
+
+  // Fast reversal bonus: if price started dropping from spike, immediate signal
+  const recovering = m.price < m.prev; // price coming back down = fade opportunity
+  if (recovering) score += 15;
 
   score = Math.max(0, Math.min(100, score));
 
@@ -691,7 +813,7 @@ function getTennisSpikeSignal(m) {
     edge: price - earliestPrice,
     direction: "NO",
     timestamp: Date.now(),
-    description: `TENNIS SPIKE: Was ~${earliestPrice}¢, now ${price}¢ — overextended favorite, fade opportunity`,
+    description: `TENNIS SPIKE: Was ~${earliestPrice}¢, now ${price}¢ — overextended favorite, fade opportunity${recovering ? " [REVERSING]" : ""}`,
     strength: level,
     score,
     action: "BUY",
@@ -703,95 +825,105 @@ function getTennisSpikeSignal(m) {
   };
 }
 
-function detectOpportunities(currentMarkets) {
-  const newOpps = [];
-  const seen = new Set();
+// detectOpportunities is now inlined in fetchAllMarkets for efficiency
 
-  for (const m of currentMarkets) {
-    if (m.price <= 0) continue;
+// ============================================================
+// MARKET FETCHING — PRIORITY QUEUE ARCHITECTURE
+// ============================================================
+// Full scan: all markets every POLL_INTERVAL (5s)
+// Fast scan: priority markets every FAST_POLL_INTERVAL (2s)
+// ============================================================
 
-    // Update price history
-    updatePriceHistory(m.ticker, m.price);
+async function fetchAllMarkets(fastOnly = false) {
+  const now = Date.now();
 
-    // Update peak price tracking
-    const currentPeak = peakPrices[m.ticker] || 0;
-    if (m.price > currentPeak) {
-      peakPrices[m.ticker] = m.price;
-    }
-    const prev = previousPrices[m.ticker];
-    if (prev !== undefined && prev > (peakPrices[m.ticker] || 0)) {
-      peakPrices[m.ticker] = prev;
-    }
-
-    // Strategy 1: Comeback detection (primary)
-    const comeback = getComebackSignal(m);
-    if (comeback && !seen.has(m.ticker)) {
-      seen.add(m.ticker);
-      newOpps.push(comeback);
-      continue;
-    }
-
-    // Strategy 2: Tennis spike detection
-    const spike = getTennisSpikeSignal(m);
-    if (spike && !seen.has(m.ticker)) {
-      seen.add(m.ticker);
-      newOpps.push(spike);
-      continue;
-    }
-
-    // Strategy 3: Early setup detection
-    const setup = getEarlySetupSignal(m);
-    if (setup && !seen.has(m.ticker)) {
-      seen.add(m.ticker);
-      newOpps.push(setup);
-      continue;
-    }
+  if (fastOnly) {
+    if (now - lastFastFetchTime < FAST_POLL_INTERVAL - 500) return;
+  } else {
+    if (now - lastFetchTime < POLL_INTERVAL - 1000) return;
   }
 
-  newOpps.sort((a, b) => b.score - a.score);
-  return newOpps;
-}
-
-// ============================================================
-// MARKET FETCHING
-// ============================================================
-async function fetchAllMarkets() {
-  const now = Date.now();
-  if (now - lastFetchTime < POLL_INTERVAL - 1000) return;
-
   try {
+    // Re-discover universe periodically
     if (!trackedMarketUniverse.length || now - lastDiscoveryTime >= DISCOVERY_INTERVAL) {
       await discoverTrackedMarketUniverse();
     }
 
-    const cleanMarkets = (await hydrateTrackedMarkets())
+    // For fast poll, only hydrate priority tickers
+    let marketsToHydrate = trackedMarketUniverse;
+    if (fastOnly && priorityTickers.size > 0) {
+      marketsToHydrate = trackedMarketUniverse.filter(m => priorityTickers.has(m.ticker));
+    }
+
+    const cleanMarkets = (await mapWithConcurrency(marketsToHydrate, FETCH_CONCURRENCY, async (market) => {
+      const bookData = await kalshiFetch(`/markets/${market.ticker}/orderbook`);
+      const book = summarizeOrderbook(bookData);
+      return {
+        ...market,
+        yes_bid_dollars: book.yesBid / 100,
+        yes_ask_dollars: book.yesAsk / 100,
+        no_bid_dollars: book.noBid / 100,
+        no_ask_dollars: book.noAsk / 100,
+        last_price_dollars: book.midpoint / 100,
+        previous_price_dollars: (previousPrices[market.ticker] || book.midpoint) / 100,
+        volume: book.volume,
+      };
+    }))
       .filter(isCleanSingleMarket)
       .filter(isTradableMarket);
 
-    console.log("Sample clean markets:", cleanMarkets.slice(0, 5));
+    // Normalize ALL markets (no cap)
+    const normalized = cleanMarkets.map(normalizeMarket);
 
-    const normalized = cleanMarkets.slice(0, MAX_TRACKED_MARKETS).map(normalizeMarket);
+    const allSports = normalized
+      .filter((m) => ["NBA", "NFL", "NHL", "TENNIS", "MLB"].includes(m.sport));
 
-    const filtered = normalized
-      .filter((m) => ["NBA", "NFL", "NHL", "TENNIS", "MLB"].includes(m.sport))
-      // Prioritize markets with recent price movement and higher volume
-      .sort((a, b) => {
-        const aMove = Math.abs(a.price - a.prev);
-        const bMove = Math.abs(b.price - b.prev);
-        if (bMove !== aMove) return bMove - aMove; // most movement first
-        return b.volume - a.volume; // then highest volume
-      });
+    // Update price history + peaks for ALL markets (full tracking)
+    for (const m of allSports) {
+      updatePriceHistory(m.ticker, m.price);
+      const currentPeak = peakPrices[m.ticker] || 0;
+      if (m.price > currentPeak) peakPrices[m.ticker] = m.price;
+      const prev = previousPrices[m.ticker];
+      if (prev !== undefined && prev > (peakPrices[m.ticker] || 0)) {
+        peakPrices[m.ticker] = prev;
+      }
+    }
 
-    // Detect opportunities BEFORE updating prices
-    const newOpps = detectOpportunities(filtered);
+    // COMEBACK CANDIDATE PRE-FILTER — only these get signal logic
+    const comebackCandidates = allSports.filter(isComebackCandidate);
+
+    // Also include setup/spike candidates (high price or tennis)
+    const signalCandidates = allSports.filter(m => {
+      if (comebackCandidates.some(c => c.ticker === m.ticker)) return false; // already included
+      // Setup candidate: high-priced favorite
+      if (m.price >= 65 && m.spread >= 3 && m.volume >= 2000) return true;
+      // Tennis spike candidate
+      if (m.sport === "TENNIS" && m.price >= 75 && m.volume >= 1000) return true;
+      return false;
+    });
+
+    const allCandidates = [...comebackCandidates, ...signalCandidates];
+
+    // Run signal engine ONLY on filtered candidates
+    const newOpps = [];
+    const seen = new Set();
+    for (const m of allCandidates) {
+      if (seen.has(m.ticker)) continue;
+      const comeback = getComebackSignal(m);
+      if (comeback) { seen.add(m.ticker); newOpps.push(comeback); continue; }
+      const spike = getTennisSpikeSignal(m);
+      if (spike) { seen.add(m.ticker); newOpps.push(spike); continue; }
+      const setup = getEarlySetupSignal(m);
+      if (setup) { seen.add(m.ticker); newOpps.push(setup); continue; }
+    }
+    newOpps.sort((a, b) => b.score - a.score);
 
     // Update previous prices AFTER detection
-    for (const m of filtered) {
+    for (const m of allSports) {
       previousPrices[m.ticker] = m.price;
     }
 
-    // Merge: new signals first, then keep recent old ones, cap at 50
-    // Deduplicate by ticker — keep newest
+    // Merge signals
     const tickerMap = new Map();
     for (const opp of [...newOpps, ...opportunities]) {
       if (!tickerMap.has(opp.ticker)) {
@@ -800,15 +932,25 @@ async function fetchAllMarkets() {
     }
     opportunities = Array.from(tickerMap.values())
       .sort((a, b) => b.score - a.score)
-      .slice(0, 50);
+      .slice(0, 100);
 
-    markets = filtered;
+    // PRIORITY QUEUE — score all markets, top N get fast polling
+    const scored = allSports.map(m => ({ ticker: m.ticker, priority: calculatePriorityScore(m) }));
+    scored.sort((a, b) => b.priority - a.priority);
+    priorityTickers = new Set(scored.slice(0, PRIORITY_TIER_SIZE).map(s => s.ticker));
+
+    markets = allSports;
     lastScan = Date.now();
-    lastFetchTime = Date.now();
+    if (fastOnly) {
+      lastFastFetchTime = Date.now();
+    } else {
+      lastFetchTime = Date.now();
+      lastFastFetchTime = Date.now();
+    }
     scanCount++;
 
     const sportCounts = {};
-    filtered.forEach((m) => {
+    allSports.forEach((m) => {
       sportCounts[m.sport] = (sportCounts[m.sport] || 0) + 1;
     });
 
@@ -818,7 +960,7 @@ async function fetchAllMarkets() {
     });
 
     console.log(
-      `[SCAN #${scanCount}] ${discoveryStats.total} source → ${discoveryStats.sports} sports wrappers → ${discoveryStats.discovered} discovered singles → ${cleanMarkets.length} clean+tradable → ${filtered.length} tracked | Signals: ${opportunities.length} (S:${levelCounts.STRONG} N:${levelCounts.NORMAL} W:${levelCounts.WEAK}) | Sports: ${JSON.stringify(sportCounts)}`
+      `[SCAN #${scanCount}${fastOnly ? " FAST" : ""}] ${allSports.length} live sports | ${comebackCandidates.length} comeback candidates | ${allCandidates.length} signal candidates | Priority: ${priorityTickers.size} | Signals: ${opportunities.length} (S:${levelCounts.STRONG} N:${levelCounts.NORMAL} W:${levelCounts.WEAK}) | Sports: ${JSON.stringify(sportCounts)}`
     );
   } catch (err) {
     console.error("[SCAN ERROR]", err.message);
@@ -893,7 +1035,11 @@ app.get("/api/peaks-debug", (req, res) => {
     const currentPrice = market ? market.price : null;
     const drop = currentPrice !== null ? peak - currentPrice : null;
     const volume = market ? market.volume : null;
-    return { ticker, peak, currentPrice, drop, volume, wouldSignal: peak >= 55 && drop >= 5 && currentPrice >= 15 && currentPrice <= 85 && volume >= 1000 };
+    const sport = market ? market.sport : null;
+    const isTennis = sport === "TENNIS";
+    const peakReq = isTennis ? 50 : 55;
+    const dropReq = isTennis ? 3 : 5;
+    return { ticker, peak, currentPrice, drop, volume, sport, wouldSignal: peak >= peakReq && drop >= dropReq && currentPrice >= 15 && currentPrice <= 85 && volume >= 1000 };
   });
   peakEntries.sort((a, b) => (b.drop || 0) - (a.drop || 0));
   res.json({
@@ -905,25 +1051,55 @@ app.get("/api/peaks-debug", (req, res) => {
   });
 });
 
+app.get("/api/priority-debug", (req, res) => {
+  const allScored = markets.map(m => ({
+    ticker: m.ticker,
+    sport: m.sport,
+    price: m.price,
+    volume: m.volume,
+    spread: m.spread,
+    peak: peakPrices[m.ticker] || m.price,
+    drop: (peakPrices[m.ticker] || m.price) - m.price,
+    priority: calculatePriorityScore(m),
+    isPriority: priorityTickers.has(m.ticker),
+    isCandidate: isComebackCandidate(m),
+  }));
+  allScored.sort((a, b) => b.priority - a.priority);
+  res.json({
+    totalMarkets: markets.length,
+    priorityCount: priorityTickers.size,
+    candidateCount: allScored.filter(s => s.isCandidate).length,
+    markets: allScored,
+  });
+});
+
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", scans: scanCount, markets: markets.length });
+  res.json({ status: "ok", scans: scanCount, markets: markets.length, priority: priorityTickers.size });
 });
 
 // ============================================================
-// START
+// START — DUAL-SPEED POLLING
 // ============================================================
 console.log("=".repeat(60));
-console.log("  KALSHI EDGE SCANNER v7.0 — MULTI-STRATEGY DETECTOR");
+console.log("  KALSHI EDGE SCANNER v8.0 — PRIORITY QUEUE ENGINE");
+console.log("  Full scan: ALL live markets every 5s");
+console.log("  Fast scan: TOP 30 priority markets every 2s");
+console.log("  Pre-filter: Comeback candidates only get signal logic");
+console.log("  Sport configs: TENNIS(50/3) NBA/NFL(55/5) NHL/MLB(52/4)");
 console.log("  Strategies: COMEBACK | SETUP | TENNIS_SPIKE");
 console.log("  Signal Levels: WEAK | NORMAL | STRONG (scored 0-100)");
-console.log("  Momentum tracking: last 10 ticks per market");
 console.log(`  API Key: ${API_KEY_ID ? "✓ configured" : "✗ missing KALSHI_API_KEY"}`);
 console.log(`  Private Key: ${PRIVATE_KEY ? "✓ loaded" : "✗ missing PEM file"}`);
-console.log(`  Poll Interval: ${POLL_INTERVAL}ms`);
 console.log("=".repeat(60));
 
-fetchAllMarkets();
-setInterval(fetchAllMarkets, POLL_INTERVAL);
+// Initial full scan
+fetchAllMarkets(false);
+
+// Full scan every POLL_INTERVAL (5s)
+setInterval(() => fetchAllMarkets(false), POLL_INTERVAL);
+
+// Fast scan for priority markets every FAST_POLL_INTERVAL (2s)
+setInterval(() => fetchAllMarkets(true), FAST_POLL_INTERVAL);
 
 app.listen(PORT, () => {
   console.log(`[SERVER] Listening on port ${PORT}`);
