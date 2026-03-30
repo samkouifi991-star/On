@@ -90,6 +90,8 @@ let lastScan = 0;
 let scanCount = 0;
 let previousPrices = {};
 let peakPrices = {};
+let priceHistory = {};       // ticker → [last N prices] for momentum
+const HISTORY_LENGTH = 10;
 let lastFetchTime = 0;
 let lastDiscoveryTime = 0;
 let trackedMarketUniverse = [];
@@ -194,8 +196,24 @@ function trackReject(reason, sample) {
   }
 }
 
+function isLiveMarket(m) {
+  if (!m) return false;
+  // Kalshi uses: status "open"/"active"/"closed"/"settled"
+  // and sometimes an "is_active" or game_status field
+  const status = (m.status || "").toLowerCase();
+  const gameStatus = (m.game_status || m.result || "").toLowerCase();
+
+  // Reject settled, closed, or finalized markets
+  if (["closed", "settled", "finalized", "inactive"].includes(status)) return false;
+  if (["settled", "closed", "finalized"].includes(gameStatus)) return false;
+
+  // Accept open/active markets
+  return true;
+}
+
 function isTradableMarket(m) {
   if (!m) return false;
+  if (!isLiveMarket(m)) return false;
   const p = extractPrices(m);
   const price = p.yes_ask || p.last_price || p.prev_price;
   return price > 0;
@@ -470,12 +488,38 @@ async function hydrateTrackedMarkets() {
 }
 
 // ============================================================
-// SIGNAL ENGINE v6 — TIERED COMEBACK DETECTOR
+// SIGNAL ENGINE v7 — MULTI-STRATEGY DETECTOR
 // ============================================================
-// Produces WEAK / NORMAL / STRONG signals using a scoring system.
-// Base filters: peak >= 55¢, drop >= 5¢, volume >= 1000
-// Signal tiers: WEAK (drop>=5), NORMAL (drop>=7), STRONG (drop>=10)
+// Strategies:
+//   1. COMEBACK — peak drop detection (WEAK/NORMAL/STRONG)
+//   2. SETUP — early detection before full drop
+//   3. TENNIS_SPIKE — overextended favorite in tennis
+// Momentum confirmation boosts signal strength.
 // ============================================================
+
+function updatePriceHistory(ticker, price) {
+  if (!priceHistory[ticker]) priceHistory[ticker] = [];
+  priceHistory[ticker].push(price);
+  if (priceHistory[ticker].length > HISTORY_LENGTH) {
+    priceHistory[ticker].shift();
+  }
+}
+
+function getMomentum(ticker) {
+  const hist = priceHistory[ticker];
+  if (!hist || hist.length < 3) return "FLAT";
+  const last3 = hist.slice(-3);
+  if (last3[0] > last3[1] && last3[1] > last3[2]) return "DOWN";  // falling
+  if (last3[0] < last3[1] && last3[1] < last3[2]) return "UP";    // rising
+  return "FLAT";
+}
+
+function getMomentumBoost(ticker) {
+  const mom = getMomentum(ticker);
+  if (mom === "DOWN") return 15;  // price falling = comeback opportunity
+  if (mom === "UP") return 5;     // recovering
+  return 0;
+}
 
 function getComebackSignal(m) {
   if (!m) return null;
@@ -484,50 +528,46 @@ function getComebackSignal(m) {
   const price = m.price;
   const prev = m.prev;
 
-  // Base filter: peak must have been a favorite
   if (peak < 55) return null;
 
   const drop = peak - price;
   if (drop < 5) return null;
 
-  // Price zone filter
   if (price < 15 || price > 85) return null;
-
-  // Volume filter — must have liquidity
   if (m.volume < 1000) return null;
 
   const stabilizing = Math.abs(price - prev) < 2;
   const recovering = price > prev;
 
-  // --- Scoring system (0-100) ---
   let score = 0;
 
-  // Drop strength (dynamic tiers)
+  // Drop strength
   if (drop >= 20) score += 40;
   else if (drop >= 15) score += 30;
   else if (drop >= 10) score += 20;
   else if (drop >= 7) score += 12;
-  else score += 5; // drop >= 5
+  else score += 5;
 
   // Recovery behavior
   if (recovering) score += 30;
   else if (stabilizing) score += 15;
 
-  // Liquidity quality (bonuses)
+  // Momentum confirmation
+  score += getMomentumBoost(m.ticker);
+
+  // Liquidity bonuses
   if (m.volume >= 5000) score += 15;
   else if (m.volume >= 2000) score += 10;
   if (m.spread <= 5) score += 15;
-
-  // Liquidity penalties
   if (m.spread > 7) score -= 20;
 
-  // Clamp score
   score = Math.max(0, Math.min(100, score));
 
-  // Determine level based on drop size AND score
   let level = "WEAK";
-  if (drop >= 10 && score >= 70) level = "STRONG";
-  else if (drop >= 7 && score >= 40) level = "NORMAL";
+  if (drop >= 10 && score >= 60) level = "STRONG";
+  else if (drop >= 7 && score >= 35) level = "NORMAL";
+
+  const momentum = getMomentum(m.ticker);
 
   return {
     id: `${m.ticker}-comeback-${Date.now()}`,
@@ -540,13 +580,124 @@ function getComebackSignal(m) {
     edge: drop,
     direction: "YES",
     timestamp: Date.now(),
-    description: `Peaked at ${peak}¢, dropped ${drop}¢ to ${price}¢ — ${recovering ? "recovering" : stabilizing ? "stabilizing" : "falling"}`,
+    description: `Peaked at ${peak}¢, dropped ${drop}¢ to ${price}¢ — ${recovering ? "recovering" : stabilizing ? "stabilizing" : "falling"} [${momentum}]`,
     strength: level,
     score,
     action: "BUY",
     peakPrice: peak,
     dropSize: drop,
     recovering,
+    volume: m.volume,
+    spread: m.spread,
+  };
+}
+
+function getEarlySetupSignal(m) {
+  if (!m) return null;
+  const price = m.price;
+
+  // Early detection: high-priced favorite with wide spread and volume
+  if (price < 65) return null;
+  if (m.spread < 3) return null;
+  if (m.volume < 2000) return null;
+
+  // Don't emit SETUP if we already have a COMEBACK for this ticker
+  const peak = peakPrices[m.ticker] || price;
+  const drop = peak - price;
+  if (drop >= 5) return null; // comeback signal will handle it
+
+  let score = 10;
+
+  // Higher price = more potential for drop
+  if (price >= 80) score += 20;
+  else if (price >= 75) score += 15;
+  else if (price >= 70) score += 10;
+
+  // Wide spread = instability
+  if (m.spread >= 6) score += 15;
+  else if (m.spread >= 4) score += 10;
+
+  // High volume = significance
+  if (m.volume >= 5000) score += 15;
+  else if (m.volume >= 3000) score += 10;
+
+  // Momentum: if price just started falling, boost
+  score += getMomentumBoost(m.ticker);
+
+  score = Math.max(0, Math.min(100, score));
+
+  return {
+    id: `${m.ticker}-setup-${Date.now()}`,
+    type: "COMEBACK",
+    match: m.match,
+    sport: m.sport,
+    ticker: m.ticker,
+    price,
+    prev: m.prev,
+    edge: 0,
+    direction: "YES",
+    timestamp: Date.now(),
+    description: `SETUP: Favorite at ${price}¢ with ${m.spread}¢ spread — watching for drop`,
+    strength: "WEAK",
+    score,
+    action: "BUY",
+    peakPrice: peak,
+    dropSize: 0,
+    recovering: false,
+    volume: m.volume,
+    spread: m.spread,
+  };
+}
+
+function getTennisSpikeSignal(m) {
+  if (!m) return null;
+  if (m.sport !== "TENNIS") return null;
+
+  const price = m.price;
+  if (price < 85) return null;
+  if (m.volume < 1000) return null;
+
+  // Check if pre-game odds were roughly even (prev/seed ≈ 50 ± 10)
+  const seedPrice = peakPrices[m.ticker] ? null : m.prev; // use prev as proxy for pre-game
+  const hist = priceHistory[m.ticker];
+  const earliestPrice = hist && hist.length > 0 ? hist[0] : m.prev;
+
+  // If the earliest tracked price was near 50/50, this is an overextension
+  const wasEven = earliestPrice >= 40 && earliestPrice <= 60;
+
+  if (!wasEven) return null;
+
+  let level = "WEAK";
+  let score = 30;
+
+  if (price >= 95) { level = "STRONG"; score = 85; }
+  else if (price >= 90) { level = "NORMAL"; score = 60; }
+  else { level = "WEAK"; score = 40; }
+
+  // Volume boost
+  if (m.volume >= 5000) score += 15;
+  else if (m.volume >= 2000) score += 10;
+
+  score = Math.max(0, Math.min(100, score));
+
+  return {
+    id: `${m.ticker}-tennis-spike-${Date.now()}`,
+    type: "COMEBACK",
+    match: m.match,
+    sport: m.sport,
+    ticker: m.ticker,
+    price,
+    prev: m.prev,
+    edge: price - earliestPrice,
+    direction: "NO",
+    timestamp: Date.now(),
+    description: `TENNIS SPIKE: Was ~${earliestPrice}¢, now ${price}¢ — overextended favorite, fade opportunity`,
+    strength: level,
+    score,
+    action: "BUY",
+    peakPrice: price,
+    dropSize: 0,
+    recovering: false,
     volume: m.volume,
     spread: m.spread,
   };
@@ -559,29 +710,44 @@ function detectOpportunities(currentMarkets) {
   for (const m of currentMarkets) {
     if (m.price <= 0) continue;
 
+    // Update price history
+    updatePriceHistory(m.ticker, m.price);
+
     // Update peak price tracking
     const currentPeak = peakPrices[m.ticker] || 0;
     if (m.price > currentPeak) {
       peakPrices[m.ticker] = m.price;
     }
-
-    // Update peak from prev too
     const prev = previousPrices[m.ticker];
     if (prev !== undefined && prev > (peakPrices[m.ticker] || 0)) {
       peakPrices[m.ticker] = prev;
     }
 
-    const signal = getComebackSignal(m);
-    if (!signal) continue;
+    // Strategy 1: Comeback detection (primary)
+    const comeback = getComebackSignal(m);
+    if (comeback && !seen.has(m.ticker)) {
+      seen.add(m.ticker);
+      newOpps.push(comeback);
+      continue;
+    }
 
-    // Deduplicate by ticker (keep highest score)
-    if (seen.has(m.ticker)) continue;
-    seen.add(m.ticker);
+    // Strategy 2: Tennis spike detection
+    const spike = getTennisSpikeSignal(m);
+    if (spike && !seen.has(m.ticker)) {
+      seen.add(m.ticker);
+      newOpps.push(spike);
+      continue;
+    }
 
-    newOpps.push(signal);
+    // Strategy 3: Early setup detection
+    const setup = getEarlySetupSignal(m);
+    if (setup && !seen.has(m.ticker)) {
+      seen.add(m.ticker);
+      newOpps.push(setup);
+      continue;
+    }
   }
 
-  // Sort by score descending
   newOpps.sort((a, b) => b.score - a.score);
   return newOpps;
 }
@@ -606,9 +772,15 @@ async function fetchAllMarkets() {
 
     const normalized = cleanMarkets.slice(0, MAX_TRACKED_MARKETS).map(normalizeMarket);
 
-    const filtered = normalized.filter(
-      (m) => ["NBA", "NFL", "NHL", "TENNIS", "MLB"].includes(m.sport)
-    );
+    const filtered = normalized
+      .filter((m) => ["NBA", "NFL", "NHL", "TENNIS", "MLB"].includes(m.sport))
+      // Prioritize markets with recent price movement and higher volume
+      .sort((a, b) => {
+        const aMove = Math.abs(a.price - a.prev);
+        const bMove = Math.abs(b.price - b.prev);
+        if (bMove !== aMove) return bMove - aMove; // most movement first
+        return b.volume - a.volume; // then highest volume
+      });
 
     // Detect opportunities BEFORE updating prices
     const newOpps = detectOpportunities(filtered);
@@ -741,8 +913,10 @@ app.get("/health", (req, res) => {
 // START
 // ============================================================
 console.log("=".repeat(60));
-console.log("  KALSHI EDGE SCANNER v6.0 — TIERED COMEBACK DETECTOR");
+console.log("  KALSHI EDGE SCANNER v7.0 — MULTI-STRATEGY DETECTOR");
+console.log("  Strategies: COMEBACK | SETUP | TENNIS_SPIKE");
 console.log("  Signal Levels: WEAK | NORMAL | STRONG (scored 0-100)");
+console.log("  Momentum tracking: last 10 ticks per market");
 console.log(`  API Key: ${API_KEY_ID ? "✓ configured" : "✗ missing KALSHI_API_KEY"}`);
 console.log(`  Private Key: ${PRIVATE_KEY ? "✓ loaded" : "✗ missing PEM file"}`);
 console.log(`  Poll Interval: ${POLL_INTERVAL}ms`);
