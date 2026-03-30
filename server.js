@@ -8,6 +8,7 @@ app.use(cors());
 const PORT = process.env.PORT || 3001;
 const KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2";
 const POLL_INTERVAL = 3000;
+const TENNIS_SERIES = ["KXATPMATCH", "KXWTAMATCH"];
 
 // ── State ──
 let liveMarkets = [];
@@ -18,69 +19,55 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// ── Step 1: Fetch ALL open markets, then filter tennis locally ──
+// ── Step 1: Fetch tennis markets using correct series tickers ──
 async function fetchTennisMarkets() {
-  const allTennis = [];
-  let cursor = null;
-  let pages = 0;
-  const MAX_PAGES = 10;
+  const allMarkets = [];
 
-  try {
-    while (pages < MAX_PAGES) {
-      let url = `${KALSHI_API}/markets?limit=200&status=active`;
-      if (cursor) url += `&cursor=${cursor}`;
-
+  for (const series of TENNIS_SERIES) {
+    try {
+      const url = `${KALSHI_API}/events?series_ticker=${series}&limit=100&status=open&with_nested_markets=true`;
       const res = await fetch(url, {
         headers: { "Accept": "application/json" }
       });
 
       if (!res.ok) {
-        console.error(`[FETCH] API returned ${res.status}`);
-        break;
+        console.error(`[FETCH] ${series}: API returned ${res.status}`);
+        continue;
       }
 
       const data = await res.json();
-      const markets = data.markets || [];
+      const events = data.events || [];
 
-      // Filter tennis locally
-      for (const m of markets) {
-        const ticker = (m.ticker || "").toUpperCase();
-        const title = (m.title || "").toUpperCase();
-        const eventTicker = (m.event_ticker || "").toUpperCase();
-
-        if (
-          ticker.includes("KXATP") || ticker.includes("KXWTA") ||
-          eventTicker.includes("KXATP") || eventTicker.includes("KXWTA") ||
-          title.includes("ATP") || title.includes("WTA") ||
-          title.includes("TENNIS")
-        ) {
-          allTennis.push(m);
+      for (const event of events) {
+        const markets = event.markets || [];
+        for (const m of markets) {
+          allMarkets.push({
+            ticker: m.ticker,
+            title: m.title || event.title,
+            event_ticker: event.event_ticker,
+            status: m.status,
+            yes_bid: parseFloat(m.yes_bid_dollars) || 0,
+            yes_ask: parseFloat(m.yes_ask_dollars) || 0,
+            last_price: parseFloat(m.last_price_dollars) || 0,
+            volume: parseInt(m.volume_fp) || 0,
+            series: series
+          });
         }
       }
 
-      pages++;
-      cursor = data.cursor;
-
-      // Stop if no more pages
-      if (!cursor || markets.length < 200) break;
-
-      // Rate limit protection
-      await sleep(250);
+      // Small delay between series requests
+      await sleep(200);
+    } catch (err) {
+      console.error(`[FETCH] ${series} error:`, err.message);
     }
-  } catch (err) {
-    console.error("[FETCH] Error:", err.message);
   }
 
-  console.log(`[FETCH] Scanned ${pages} pages, found ${allTennis.length} tennis markets`);
-  return allTennis;
+  return allMarkets;
 }
 
-// ── Step 2: Keep only live/active ──
+// ── Step 2: Filter live/active only ──
 function filterLive(markets) {
-  return markets.filter(m => {
-    const status = (m.status || "").toLowerCase();
-    return status === "active" || status === "open" || status === "live";
-  });
+  return markets.filter(m => m.status === "active");
 }
 
 // ── Step 3: Track peaks ──
@@ -97,7 +84,7 @@ function trackPeaks(markets) {
   }
 }
 
-// ── Step 4: Detect signals ──
+// ── Step 4: Detect signals (peak >= 50¢, drop >= 3¢) ──
 function detectSignals(markets) {
   const results = [];
 
@@ -112,7 +99,7 @@ function detectSignals(markets) {
 
       results.push({
         ticker: m.ticker,
-        title: m.title || m.ticker,
+        title: m.title,
         price: m.currentPrice,
         peak: m.peak,
         drop: m.drop,
@@ -137,11 +124,12 @@ async function scan() {
 
   liveMarkets = live.map(m => ({
     ticker: m.ticker,
-    title: m.title || m.ticker,
+    title: m.title,
     price: m.currentPrice,
     peak: m.peak,
     drop: m.drop,
-    status: m.status
+    status: m.status,
+    series: m.series
   }));
 
   signals = newSignals;
